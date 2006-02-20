@@ -40,7 +40,7 @@
 #define MY_ID "klog_in"
 #define MAXLINE 4096
 
-static int kfd = -1;
+int kfd = -1;
 
 static int kx = 0;
 static char kline[MAXLINE + 1];

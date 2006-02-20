@@ -58,6 +58,9 @@ int prune = 0;
 
 extern int __notify_78945668_info__;
 
+/* kernel log fd */
+extern int kfd;
+
 /* Static Modules */
 int asl_in_init();
 int asl_in_reset();
@@ -295,11 +298,11 @@ int
 main(int argc, char *argv[])
 {
 	struct module_list *mod;
-	fd_set rd, wr, ex;
+	fd_set rd, wr, ex, kern;
 	int fd, i, max, status, pdays, daemonize;
 	time_t lastmark, msec, ssec, tick, delta, ptime, notify_time;
 	char *mp, *str;
-	struct timeval timeout, *pto;
+	struct timeval timeout, *pto, zto;
 	asl_msg_t *pq;
 
 	mp = _PATH_MODULE_LIB;
@@ -307,6 +310,10 @@ main(int argc, char *argv[])
 	pdays = DEFAULT_PRUNE_DAYS;
 	daemonize = 0;
 	__notify_78945668_info__ = -1;
+	kfd = -1;
+	zto.tv_sec = 0;
+	zto.tv_usec = 0;
+	FD_ZERO(&kern);
 
 	for (i = 1; i < argc; i++)
 	{
@@ -378,7 +385,7 @@ main(int argc, char *argv[])
 		if (daemonize != 0)
 		{
 			if (fork() != 0) exit(0);
-			
+
 			detach();
 			closeall();
 		}
@@ -414,12 +421,38 @@ main(int argc, char *argv[])
 	ptime = 0;
 	if (pdays > 0) ptime = lastmark + PRUNE_AFTER_START_DELAY;
 
+	if (kfd >= 0) FD_SET(kfd, &kern);
+
+	/*
+	 * drain /dev/klog first
+	 */
+	if (kfd >= 0)
+	{
+		max = kfd + 1;
+		while (select(max, &kern, NULL, NULL, &zto) > 0)
+		{
+			aslevent_handleevent(kern, wr, ex, NULL);
+		}
+	}
+	
 	forever
 	{
 		if (pto != NULL) pto->tv_sec = ssec;
-		max = aslevent_fdsets(&rd, &wr, &ex);
+		max = aslevent_fdsets(&rd, &wr, &ex) + 1;
 
-		status = select(max+1, &rd, &wr, &ex, pto);
+		status = select(max, &rd, &wr, &ex, pto);
+		if ((kfd >= 0) && FD_ISSET(kfd, &rd))
+		{
+			/*
+			 * drain /dev/klog
+			 */
+			max = kfd + 1;
+
+			while (select(max, &kern, NULL, NULL, &zto) > 0)
+			{
+				aslevent_handleevent(kern, wr, ex, NULL);
+			}
+		}
 
 		if (reset != 0)
 		{
@@ -454,7 +487,7 @@ main(int argc, char *argv[])
 				asprintf(&str, "-%dd", pdays);
 				asl_set_query(pq, ASL_KEY_TIME, str, ASL_QUERY_OP_LESS);
 				if (str != NULL) free(str);
-			
+
 				/* asl_prune frees the query */
 				asl_prune(pq);
 				ptime = 0;
