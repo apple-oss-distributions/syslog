@@ -655,6 +655,7 @@ register_session(task_name_t task_name, pid_t pid)
 	asldebug("register_session: %u   PID %d\n", (unsigned int)task_name, (int)pid);
 
 	/* register for port death notification */
+	previous = MACH_PORT_NULL;
 	mach_port_request_notification(mach_task_self(), task_name, MACH_NOTIFY_DEAD_NAME, 0, global.dead_session_port, MACH_MSG_TYPE_MAKE_SEND_ONCE, &previous);
 	mach_port_deallocate(mach_task_self(), previous);
 
@@ -1017,7 +1018,7 @@ syslogd_state_query(asl_msg_t *q, asl_msg_list_t **res, uid_t uid)
 	return ASL_STATUS_OK;
 }
 
-static kern_return_t
+static void
 _server_message_processing(asl_request_msg *request)
 {
 	const uint32_t sbits = MACH_SEND_MSG | MACH_SEND_TIMEOUT;;
@@ -1189,7 +1190,6 @@ database_server()
 			continue;
 		}
 
-		int64_t msize = 0;
 		if (request->head.msgh_id == asl_server_message_num)
 		{
 			_server_message_processing(request);
@@ -1202,30 +1202,15 @@ database_server()
 }
 
 static void
-caller_get_read_entitlement(pid_t pid, uid_t *uid, gid_t *gid)
+caller_get_read_entitlement(audit_token_t *token, uid_t *uid, gid_t *gid)
 {
 #if TARGET_OS_EMBEDDED
-	xpc_object_t edata, entitlements, val;
+	xpc_object_t entitlements, val;
 	bool bval = false;
 	int64_t ival = -2;
-	size_t len;
-	const void *ptr;
 
-	edata = xpc_copy_entitlements_for_pid(pid);
-	if (edata == NULL) return;
-
-	ptr = xpc_data_get_bytes_ptr(edata);
-	len = xpc_data_get_length(edata);
-
-	entitlements = xpc_create_from_plist(ptr, len);
-	xpc_release(edata);
+	entitlements = xpc_copy_entitlement_for_token(NULL, token);
 	if (entitlements == NULL) return;
-
-	if (xpc_get_type(entitlements) != XPC_TYPE_DICTIONARY)
-	{
-		asldebug("xpc_copy_entitlements_for_pid has non-dictionary data for pid %d\n", pid);
-		return;
-	}
 
 	bval = xpc_dictionary_get_bool(entitlements, ASL_ENTITLEMENT_KEY);
 	if (bval && (uid != NULL))
@@ -1273,9 +1258,7 @@ __asl_server_query_internal
 	mach_msg_type_number_t *replyCnt,
 	uint64_t *lastid,
 	int *status,
-	uid_t uid,
-	gid_t gid,
-	pid_t pid
+	audit_token_t *token
 )
 {
 	asl_msg_list_t *query;
@@ -1284,18 +1267,26 @@ __asl_server_query_internal
 	uint32_t outlen;
 	kern_return_t kstatus;
 
+	*reply = NULL;
+	*replyCnt = 0;
+	*lastid = 0;
 	*status = ASL_STATUS_OK;
 
 	if ((request != NULL) && (request[requestCnt - 1] != '\0'))
 	{
-		*status = ASL_STATUS_INVALID_ARG;
 		vm_deallocate(mach_task_self(), (vm_address_t)request, requestCnt);
+		*status = ASL_STATUS_INVALID_ARG;
 		return KERN_SUCCESS;
 	}
 
 	query = asl_msg_list_from_string(request);
 	if (request != NULL) vm_deallocate(mach_task_self(), (vm_address_t)request, requestCnt);
 	res = NULL;
+
+	uid_t uid = (uid_t)-1;
+	gid_t gid = (gid_t)-1;
+	pid_t pid = (pid_t)-1;
+	audit_token_to_au32(*token, NULL, &uid, &gid, NULL, NULL, &pid, NULL, NULL);
 
 	/* A query list containing a single query, which itself contains
 	 * [ASLOption control] is an internal state query */
@@ -1312,7 +1303,7 @@ __asl_server_query_internal
 
 		if (pid > 0)
 		{
-			caller_get_read_entitlement(pid, &uid, &gid);
+			caller_get_read_entitlement(token, &uid, &gid);
 			if (uid == 0) x = 0;
 		}
 
@@ -1341,7 +1332,8 @@ __asl_server_query_internal
 	if (kstatus != KERN_SUCCESS)
 	{
 		free(out);
-		return kstatus;
+		*status = ASL_STATUS_FAILED;
+		return KERN_SUCCESS;
 	}
 
 	memmove(vmbuffer, out, outlen);
@@ -1369,65 +1361,10 @@ __asl_server_query_2
 	audit_token_t token
 )
 {
-	uid_t uid = (uid_t)-1;
-	gid_t gid = (gid_t)-1;
-	pid_t pid = (pid_t)-1;
-
 	int direction = SEARCH_FORWARD;
 	if (flags & QUERY_FLAG_SEARCH_REVERSE) direction = SEARCH_BACKWARD;
 
-	audit_token_to_au32(token, NULL, &uid, &gid, NULL, NULL, &pid, NULL, NULL);
-
-	return __asl_server_query_internal(server, request, requestCnt, startid, count, QUERY_DURATION_UNLIMITED, direction, reply, replyCnt, lastid, status, uid, gid, pid);
-}
-
-kern_return_t
-__asl_server_query
-(
-	mach_port_t server,
-	caddr_t request,
-	mach_msg_type_number_t requestCnt,
-	uint64_t startid,
-	int count,
-	int flags,
-	caddr_t *reply,
-	mach_msg_type_number_t *replyCnt,
-	uint64_t *lastid,
-	int *status,
-	security_token_t *token
-)
-{
-	int direction = SEARCH_FORWARD;
-	if (flags & QUERY_FLAG_SEARCH_REVERSE) direction = SEARCH_BACKWARD;
-	
-	return __asl_server_query_internal(server, request, requestCnt, startid, count, QUERY_DURATION_UNLIMITED, direction, reply, replyCnt, lastid, status, (uid_t)token->val[0], (gid_t)token->val[1], (pid_t)-1);
-}
-
-kern_return_t
-__asl_server_query_timeout
-(
-	mach_port_t server,
-	caddr_t request,
-	mach_msg_type_number_t requestCnt,
-	uint64_t startid,
-	int count,
-	int flags,
-	caddr_t *reply,
-	mach_msg_type_number_t *replyCnt,
-	uint64_t *lastid,
-	int *status,
-	audit_token_t token
-)
-{
-	uid_t uid = (uid_t)-1;
-	gid_t gid = (gid_t)-1;
-	pid_t pid = (pid_t)-1;
-	int direction = SEARCH_FORWARD;
-	if (flags & QUERY_FLAG_SEARCH_REVERSE) direction = SEARCH_BACKWARD;
-
-	audit_token_to_au32(token, NULL, &uid, &gid, NULL, NULL, &pid, NULL, NULL);
-
-	return __asl_server_query_internal(server, request, requestCnt, startid, count, QUERY_DURATION_UNLIMITED, direction, reply, replyCnt, lastid, status, uid, gid, pid);
+	return __asl_server_query_internal(server, request, requestCnt, startid, count, QUERY_DURATION_UNLIMITED, direction, reply, replyCnt, lastid, status, &token);
 }
 
 kern_return_t
@@ -1447,26 +1384,7 @@ __asl_server_match
 	audit_token_t token
 )
 {
-	uid_t uid = (uid_t)-1;
-	gid_t gid = (gid_t)-1;
-	pid_t pid = (pid_t)-1;
-	
-	audit_token_to_au32(token, NULL, &uid, &gid, NULL, NULL, &pid, NULL, NULL);
-	
-	return __asl_server_query_internal(server, request, requestCnt, startid, count, duration, direction, reply, replyCnt, lastid, status, uid, gid, pid);
-}
-
-kern_return_t
-__asl_server_prune
-(
-	mach_port_t server,
-	caddr_t request,
-	mach_msg_type_number_t requestCnt,
-	int *status,
-	security_token_t *token
-)
-{
-	return KERN_SUCCESS;
+	return __asl_server_query_internal(server, request, requestCnt, startid, count, duration, direction, reply, replyCnt, lastid, status, &token);
 }
 
 /*
@@ -1594,9 +1512,10 @@ __asl_server_create_aux_link
 	char *url, *vmbuffer;
 	int fd;
 
-	*status = ASL_STATUS_OK;
 	*fileport = MACH_PORT_NULL;
-	*newurl = 0;
+	*newurl = NULL;
+	*newurlCnt = 0;
+	*status = ASL_STATUS_OK;
 
 	if (message == NULL)
 	{
@@ -1606,8 +1525,8 @@ __asl_server_create_aux_link
 
 	if (message[messageCnt - 1] != '\0')
 	{
-		*status = ASL_STATUS_INVALID_ARG;
 		vm_deallocate(mach_task_self(), (vm_address_t)message, messageCnt);
+		*status = ASL_STATUS_INVALID_ARG;
 		return KERN_SUCCESS;
 	}
 
@@ -1615,11 +1534,10 @@ __asl_server_create_aux_link
 
 	if ((global.dbtype & DB_TYPE_FILE) == 0)
 	{
+		vm_deallocate(mach_task_self(), (vm_address_t)message, messageCnt);
 		*status = ASL_STATUS_INVALID_STORE;
 		return KERN_SUCCESS;
 	}
-
-	*fileport = MACH_PORT_NULL;
 
 	msg = asl_msg_from_string(message);
 	vm_deallocate(mach_task_self(), (vm_address_t)message, messageCnt);
@@ -1671,7 +1589,8 @@ __asl_server_create_aux_link
 	if (kstatus != KERN_SUCCESS)
 	{
 		free(url);
-		return kstatus;
+		*status = ASL_STATUS_FAILED;
+		return KERN_SUCCESS;
 	}
 
 	memmove(vmbuffer, url, *newurlCnt);
